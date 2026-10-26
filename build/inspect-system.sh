@@ -5,7 +5,7 @@ grep -qx 'ro.mirror.software_only=1' /inspect/build.prop
 test -s /inspect/priv-app/Launcher3/Launcher3.apk
 test -s /inspect/priv-app/Settings/Settings.apk
 python /inputs/check-owner.py --system /inspect --public-key /owner.pub > /artifacts/owner-check.json
-grep -a -q 'Mirror revival: started Android with unencrypted userdata' /inspect/bin/vold
+grep -a -q 'Mirror revival: sent adbd restart and framework startup requests' /inspect/bin/vold
 test -s /inspect/framework/wifi-service.jar
 test -s /inspect/lib/modules/pronto/pronto_wlan.ko
 cmp /inspect/lib/modules/pronto/pronto_wlan.ko /artifacts/pronto_wlan.ko

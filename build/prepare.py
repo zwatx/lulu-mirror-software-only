@@ -37,6 +37,7 @@ def prepare(tree, key, inputs):
     template = read(os.path.join(inputs, 'android-revival.patch.in')).replace('@OWNER_FINGERPRINT@', owner)
     markers = {'frameworks/base/services/usb/java/com/android/server/usb/UsbDebuggingManager.java': 'MIRROR_OWNER_ADB_FINGERPRINT',
                'system/vold/cryptfs.c': 'mirror_revival_mount_unencrypted_data',
+               'system/vold/CryptCommandListener.cpp': 'The revival handoff can fail after mounting data',
                'device/qcom/msm8916_32/mixer_paths_sbc.xml': 'The MIRROR\'s AUDIO-HDR',
                'frameworks/opt/net/wifi/service/java/com/android/server/wifi/WifiStateMachine.java': 'DRIVER_LOAD_RETRY_TRIES'}
     changes = []

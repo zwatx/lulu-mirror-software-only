@@ -31,48 +31,160 @@ diff --git a/frameworks/base/services/usb/java/com/android/server/usb/UsbDebuggi
 diff --git a/system/vold/cryptfs.c b/system/vold/cryptfs.c
 --- a/system/vold/cryptfs.c
 +++ b/system/vold/cryptfs.c
-@@ -3498,13 +3498,57 @@ error_shutting_down:
-     return -1;
+@@ -1712,14 +1712,9 @@
  }
  
+ #define DATA_PREP_TIMEOUT 1000
+-static int prep_data_fs(void)
++static int wait_for_data_fs(void)
+ {
+     int i;
+-
+-    /* Do the prep of the /data filesystem */
+-    property_set("vold.post_fs_data_done", "0");
+-    property_set("vold.decrypt", "trigger_post_fs_data");
+-    SLOGD("Just triggered post_fs_data\n");
+ 
+     /* Wait a max of 50 seconds, hopefully it takes much less */
+     for (i=0; i<DATA_PREP_TIMEOUT; i++) {
+@@ -1742,6 +1737,15 @@
+     }
+ }
+ 
++static int prep_data_fs(void)
++{
++    /* Preserve the existing encryption callers' request and wait behavior. */
++    property_set("vold.post_fs_data_done", "0");
++    property_set("vold.decrypt", "trigger_post_fs_data");
++    SLOGD("Just triggered post_fs_data\n");
++    return wait_for_data_fs();
++}
++
+ static void cryptfs_set_corrupt()
+ {
+     // Mark the footer as bad
+@@ -3496,15 +3500,137 @@
+         release_wake_lock(lockid);
+     }
+     return -1;
++}
++
 +/*
-+ * The retired Mirror's signed boot image marks /data forceencrypt, but the
-+ * original encryption handoff no longer completes.  Keep its boot chain and
-+ * mount the already-created ext4 userdata filesystem directly so Android can
-+ * finish booting.  This path is reached only by init's first-boot command:
++ * Conditional unencrypted-data handoff for the revival command:
 + *     vdc --wait cryptfs enablecrypto inplace default noui
++ * Retained init/fstab compatibility must be established separately.  A failed
++ * handoff can leave mounted data and property changes; it is not safe to retry.
 + */
 +static int mirror_revival_mount_unencrypted_data(void)
 +{
-+    char real_blkdev[MAXPATHLEN] = { 0 };
++    char state[PROPERTY_VALUE_MAX];
++    struct fstab_rec *rec;
++    struct fstab data_fstab;
++    FILE *mounts;
++    char *mount_line = NULL;
++    size_t mount_line_size = 0;
++    int data_mounted = 0;
 +
-+    fs_mgr_get_crypt_info(fstab, 0, real_blkdev, sizeof(real_blkdev));
-+    if (real_blkdev[0] == '\0') {
-+        SLOGE("Mirror revival: userdata block device was not found\n");
++    property_get("ro.crypto.state", state, "");
++    if (state[0] && strcmp(state, "unencrypted")) {
++        SLOGE("Mirror revival: contradictory crypto state\n");
++        return -1;
++    }
++    property_get("vold.decrypt", state, "");
++    if (strcmp(state, "trigger_encryption")) {
++        SLOGE("Mirror revival: not in the initial encryption handoff\n");
 +        return -1;
 +    }
 +
++    rec = fs_mgr_get_entry_for_mount_point(fstab, DATA_MNT_POINT);
++    if (!rec || strcmp(rec->mount_point, DATA_MNT_POINT) ||
++        !rec->blk_device || !rec->blk_device[0] ||
++        strcmp(rec->fs_type, "ext4") || !fs_mgr_is_encryptable(rec) ||
++        fs_mgr_is_voldmanaged(rec) || fs_mgr_is_file_encrypted(rec) ||
++        fs_mgr_is_verified(rec) ||
++        (rec->flags & (MS_RDONLY | MS_REMOUNT | MS_BIND | MS_MOVE))) {
++        SLOGE("Mirror revival: no supported writable ext4 /data record\n");
++        return -1;
++    }
++
++    mounts = fopen("/proc/mounts", "r");
++    if (!mounts) {
++        SLOGE("Mirror revival: cannot inspect current mounts\n");
++        return -1;
++    }
++    while (getline(&mount_line, &mount_line_size, mounts) != -1) {
++        char *save_ptr;
++        char *mount_point;
++        /* /proc/mounts escapes whitespace in paths. Read whole lines so long
++         * option fields cannot make the /data entry disappear from the scan. */
++        strtok_r(mount_line, " \t\n", &save_ptr);
++        mount_point = strtok_r(NULL, " \t\n", &save_ptr);
++        if (!mount_point || !strcmp(mount_point, DATA_MNT_POINT) ||
++            !strncmp(mount_point, "/data/", 6)) {
++            data_mounted = 1;
++            break;
++        }
++    }
++    if (ferror(mounts) || !feof(mounts)) {
++        data_mounted = 1;
++    }
++    free(mount_line);
++    fclose(mounts);
++    if (data_mounted) {
++        SLOGE("Mirror revival: /data is occupied or mount inspection failed\n");
++        return -1;
++    }
++
++    /* Use only this /data record, never another partition's crypt device or
++     * an unchecked alternate mount record after a failed mount. */
++    data_fstab = *fstab;
++    data_fstab.num_entries = 1;
++    data_fstab.recs = rec;
 +    SLOGW("Mirror revival: mounting unencrypted userdata from %s\n",
-+          real_blkdev);
-+    if (fs_mgr_do_mount(fstab, DATA_MNT_POINT, real_blkdev, 0) != 0) {
++          rec->blk_device);
++    if (fs_mgr_do_mount(&data_fstab, DATA_MNT_POINT, rec->blk_device, 0) != 0) {
 +        SLOGE("Mirror revival: failed to mount userdata\n");
 +        return -1;
 +    }
 +
-+    property_set("ro.crypto.state", "unencrypted");
-+    property_set("vold.decrypt", "trigger_load_persist_props");
-+    if (prep_data_fs()) {
++    property_get("ro.crypto.state", state, "");
++    if (!state[0] && property_set("ro.crypto.state", "unencrypted") != 0) {
++        SLOGE("Mirror revival: crypto state request failed\n");
++        return -1;
++    }
++    /* A successful send is not semantic acceptance, especially for ro.*. */
++    property_get("ro.crypto.state", state, "");
++    if (strcmp(state, "unencrypted")) {
++        SLOGE("Mirror revival: unencrypted crypto state was not observed\n");
++        return -1;
++    }
++    if (property_set("vold.decrypt", "trigger_load_persist_props") != 0 ||
++        property_set("vold.post_fs_data_done", "0") != 0) {
++        SLOGE("Mirror revival: data preparation request failed\n");
++        return -1;
++    }
++    property_get("vold.post_fs_data_done", state, "");
++    if (strcmp(state, "0")) {
++        SLOGE("Mirror revival: data preparation marker reset was not observed\n");
++        return -1;
++    }
++    if (property_set("vold.decrypt", "trigger_post_fs_data") != 0 ||
++        wait_for_data_fs()) {
 +        SLOGE("Mirror revival: post-fs-data failed\n");
 +        return -1;
 +    }
 +
-+    /* Reload the owner's key from the now-mounted /data filesystem. */
-+    property_set("ctl.restart", "adbd");
-+    property_set("vold.decrypt", "trigger_restart_framework");
-+    SLOGW("Mirror revival: started Android with unencrypted userdata\n");
++    /* ctl.* has no readable acknowledgment; this requests a fresh ADB exchange,
++     * but does not prove a daemon restart, key reload or framework readiness. */
++    if (property_set("ctl.restart", "adbd") != 0 ||
++        property_set("vold.decrypt", "trigger_restart_framework") != 0) {
++        SLOGE("Mirror revival: startup request failed\n");
++        return -1;
++    }
++    SLOGW("Mirror revival: sent adbd restart and framework startup requests\n");
 +    return 0;
-+}
-+
+ }
+ 
  int cryptfs_enable(char *howarg, int type, char *passwd, int no_ui)
  {
 +    if (!strcmp(howarg, "inplace") && type == CRYPT_TYPE_DEFAULT && no_ui) {
@@ -89,6 +201,21 @@ diff --git a/system/vold/cryptfs.c b/system/vold/cryptfs.c
      return cryptfs_enable_internal(howarg, CRYPT_TYPE_DEFAULT,
                            DEFAULT_PASSWORD, no_ui);
  }
+diff --git a/system/vold/CryptCommandListener.cpp b/system/vold/CryptCommandListener.cpp
+--- a/system/vold/CryptCommandListener.cpp
++++ b/system/vold/CryptCommandListener.cpp
+@@ -209,7 +209,10 @@
+                 rc = cryptfs_enable(argv[2], type, argv[4], no_ui);
+             }
+ 
+-            if (rc == 0) {
++            /* The revival handoff can fail after mounting data or changing
++             * properties.  Do not kill users of /data and repeat that handoff. */
++            if (rc == 0 || (type == CRYPT_TYPE_DEFAULT && no_ui &&
++                            !strcmp(argv[2], "inplace"))) {
+                 break;
+             } else if (tries == 0) {
+                 Process::killProcessesWithOpenFiles(DATA_MNT_POINT, SIGKILL);
 diff --git a/device/qcom/msm8916_32/mixer_paths_sbc.xml b/device/qcom/msm8916_32/mixer_paths_sbc.xml
 --- a/device/qcom/msm8916_32/mixer_paths_sbc.xml
 +++ b/device/qcom/msm8916_32/mixer_paths_sbc.xml
